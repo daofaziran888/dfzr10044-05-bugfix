@@ -90,6 +90,8 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <HandoffPanel v-if="hasHandoff" :module-key="meta.key" />
   </section>
 </template>
 
@@ -104,9 +106,11 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import HandoffPanel from '@/views/HandoffPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const hasHandoff = computed(() => ['small_file_merge', 'compact_job'].includes(meta.key))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')

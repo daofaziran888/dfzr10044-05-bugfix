@@ -336,67 +336,132 @@ def _step_evolve_switch_complete(ctx: ChainContext) -> ChainContext:
 # ============================================================
 
 def _step_small_files_register(ctx: ChainContext) -> ChainContext:
-    """注册多个碎片化小文件。"""
+    """整组提交两个碎片原件（3 行、4 行）并建立确认清单基线。"""
     lk = ctx.lake_table
-    files: list[PartitionFile] = []
-    for i in range(6):
-        pf = lake_store.register_file(lk, "20261101", rows=5, bytes_=1280)
-        files.append(pf)
+    files = [
+        lake_store.register_file(lk, "20261101", rows=3, bytes_=900),
+        lake_store.register_file(lk, "20261101", rows=4, bytes_=1100),
+    ]
+    baseline = lake_store.ensure_confirmed_manifest(lk, "20261101")
     ctx.output["small_files"] = files
-    ctx.output["small_file_count"] = 6
+    ctx.output["small_file_count"] = len(files)
+    ctx.output["source_rows"] = sum(f.file_rows for f in files)
+    ctx.output["baseline_manifest_id"] = baseline.manifest_id if baseline else None
+    ctx.output["baseline_manifest_version"] = baseline.version if baseline else None
+    ctx.output["baseline_snapshot_id"] = (
+        lake_store.open_snapshot_for_manifest(lk, baseline).snapshot_id
+        if baseline else None
+    )
     return ctx
 
 
 def _step_merge_with_checkpoint(ctx: ChainContext) -> ChainContext:
-    """归并小文件推导出目标文件，保存检查点。"""
+    """整组提交原件批量归并：产物以 staged 落盘并保存检查点，尚未换版。"""
+    from app.services.small_file_merge import SmallFileMergeService
+
     lk = ctx.lake_table
     small_ids = [f.file_id for f in ctx.output.get("small_files", [])]
     merge_id = f"merge-{lk}-{uuid.uuid4().hex[:6]}"
-    # 推导归并目标：6个小文件归并为2个目标文件
-    target_files: list[dict[str, Any]] = []
-    for i in range(2):
-        target_files.append({
-            "rows": 15,
-            "bytes": 3840,
-            "source_partition": "20261101",
-            "segment": i,
-        })
-    lake_store.save_merge_checkpoint(merge_id, small_ids)
+    svc = SmallFileMergeService()
+    staged = svc.stage_batch_merge(merge_id, lk, "20261101", small_ids)
     ctx.output["merge_id"] = merge_id
-    ctx.output["target_count"] = len(target_files)
-    ctx.output["checkpoint_saved"] = True
+    ctx.output["checkpoint_saved"] = "error" not in staged
+    ctx.output["staged_merge"] = staged
+    ctx.output["product_file_ids"] = staged.get("product_file_ids", [])
+    ctx.output["draft_manifest_id"] = staged.get("draft_manifest_id")
+    ctx.output["target_count"] = len(staged.get("product_file_ids", []))
     return ctx
 
 
 def _step_merge_interrupt_recovery(ctx: ChainContext) -> ChainContext:
-    """模拟归并中断恢复：检查点存在，加载partial文件清单继续。"""
+    """中断恢复：先取一份换版前的压实工单制造交接冲突，恢复后确认换版。
+
+    恢复不得把 staged 产物并进当前分区；换版后旧工单必须交回重排。
+    """
+    from app.services.compact_job import CompactJobService
+    from app.services.small_file_merge import SmallFileMergeService
+
     lk = ctx.lake_table
     merge_id = ctx.output.get("merge_id")
+    svc = SmallFileMergeService()
     checkpoint = lake_store.get_merge_checkpoint(merge_id)
     if checkpoint is None:
         ctx.error_skip = True
         return ctx
-    old_ids = checkpoint["partial_file_ids"]
-    # 注册归并后新文件
-    for i in range(2):
-        lake_store.register_file(lk, "20261101", rows=15, bytes_=3840)
-    ctx.output["recovered_old_count"] = len(old_ids)
+
+    # 归并尚未换版时压实照常扫描：只能看到整组原件，看不到 staged 产物
+    compact_svc = CompactJobService()
+    pre_scan = compact_svc.scan_partition(lk, "20261101")
+    pre_ticket = compact_svc.open_ticket(lk, "20261101", trigger="归并中断后压实")
+    ctx.output["pre_swap_scan_files"] = pre_scan["file_count"]
+    ctx.output["pre_swap_scan_rows"] = pre_scan["rows"]
+    ctx.output["skipped_staged_count"] = len(pre_scan["skipped_staged"])
+    ctx.output["pre_swap_ticket_id"] = pre_ticket.get("ticket", {}).get("ticket_id")
+
+    recovered = svc.recover_batch_merge(merge_id, lk, confirm_swap=True)
     ctx.output["recovery_source"] = "checkpoint"
+    ctx.output["recovered_old_count"] = len(checkpoint.get("group_file_ids", []))
+    ctx.output["recovery_phase"] = (recovered or {}).get("phase")
+    ctx.output["merge_receipt"] = (recovered or {}).get("swap", {}).get("receipt")
     return ctx
 
 
 def _step_compact_confirm(ctx: ChainContext) -> ChainContext:
-    """压实确认：归并新文件写入后压实任务标记完成。"""
+    """压实接单：旧工单交回重排，新工单按唯一确认清单执行并出回执。"""
+    from app.services.compact_job import CompactJobService
+    from app.services.time_travel import TimeTravelService
+
     lk = ctx.lake_table
-    # 使用原子替换删除小文件、保留归并后大文件
-    all_files = lake_store.list_files(lk, "20261101")
-    small_to_remove = [f.file_id for f in all_files if f.file_bytes <= 1500]
-    # 原子替换（只保留大文件）
-    remaining = [f for f in all_files if f.file_bytes > 1500]
-    lake_store.replace_file_list(lk, [f.file_id for f in all_files], remaining)
-    ctx.output["files_before_compact"] = len(all_files)
-    ctx.output["files_after_compact"] = len(remaining)
-    ctx.output["compact_success"] = len(remaining) < len(all_files)
+    svc = CompactJobService()
+    stale_ticket_id = ctx.output.get("pre_swap_ticket_id")
+    stale_receipt = svc.execute_ticket(stale_ticket_id) if stale_ticket_id else None
+    ctx.output["stale_ticket_disposition"] = (stale_receipt or {}).get("disposition")
+    ctx.output["stale_ticket_processed_rows"] = (stale_receipt or {}).get("processed_rows")
+
+    # 换版后重新接单：输入只有归并产物这一份清单
+    opened = svc.open_ticket(lk, "20261101", trigger="归并产物压实")
+    if "error" in opened:
+        ctx.error_skip = True
+        ctx.output["compact_error"] = opened["error"]
+        return ctx
+    ticket = opened["ticket"]
+    ctx.output["compact_ticket_id"] = ticket["ticket_id"]
+    ctx.output["compact_ticket_manifest_version"] = ticket["manifest_version"]
+    ctx.output["rows_before_compact"] = ticket["input_rows"]
+    ctx.output["files_before_compact"] = len(ctx.output.get("small_files", []))
+    ctx.output["merge_source_file_count"] = ctx.output.get("small_file_count", 0)
+    ctx.output["merge_product_file_count"] = len(ctx.output.get("product_file_ids", []))
+
+    # 压实扫描之后再提交一个 2 行的新文件
+    late_file = lake_store.register_file(lk, "20261101", rows=2, bytes_=512, status="staged")
+    lake_store.append_to_confirmed_manifest(
+        lk, "20261101", [late_file.file_id], source="append", source_ref="late-batch")
+    ctx.output["late_file_id"] = late_file.file_id
+
+    receipt = svc.execute_ticket(ticket["ticket_id"])
+    ctx.output["compact_receipt"] = receipt
+    ctx.output["compact_success"] = receipt["disposition"] == "completed"
+    ctx.output["compact_output_rows"] = receipt.get("processed_rows")
+
+    # 压实只归拢归并产物这一份清单，扫描后追加的新文件原样并存：
+    # 本次压实真正产出 = 输出文件去掉 rebase 进来的新文件
+    compacted_outputs = [
+        fid for fid in receipt.get("output_file_ids", [])
+        if fid not in set(receipt.get("rebased_file_ids", []))
+    ]
+    ctx.output["files_after_compact"] = len(compacted_outputs)
+    ctx.output["rebased_file_count"] = len(receipt.get("rebased_file_ids", []))
+
+    current_files = lake_store.list_files(lk, "20261101")
+    ctx.output["partition_file_count_after"] = len(current_files)
+    ctx.output["rows_after_compact"] = sum(f.file_rows for f in current_files)
+
+    # 旧快照（归并前 2 个原件、7 行）仍可按编号回溯
+    tt = TimeTravelService()
+    baseline_snapshot = ctx.output.get("baseline_snapshot_id")
+    baseline_read = tt.read_at_snapshot(lk, baseline_snapshot) if baseline_snapshot else None
+    ctx.output["baseline_snapshot_rows"] = (baseline_read or {}).get("rows")
+    ctx.output["baseline_snapshot_files"] = (baseline_read or {}).get("partition_count")
     return ctx
 
 

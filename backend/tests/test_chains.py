@@ -117,7 +117,7 @@ class TestChainPartitionEvolveCoexist:
 
 
 class TestChainMergeRecoveryCompact:
-    """测试链路6：小文件归并→检查点保存→中断恢复→压实确认。"""
+    """测试链路6：整组原件批量归并→换版→压实按确认清单接收。"""
     def test_merge_recovery_full(self):
         result = run_chain(
             "chain_merge_recovery_compact",
@@ -125,9 +125,41 @@ class TestChainMergeRecoveryCompact:
             get_chain_steps("chain_merge_recovery_compact"),
         )
         assert result.success
-        assert result.final_output.get("checkpoint_saved")
-        assert result.final_output.get("compact_success")
-        assert result.final_output.get("files_after_compact", 999) < result.final_output.get("files_before_compact", 0)
+        out = result.final_output
+        assert out.get("checkpoint_saved")
+        assert out.get("compact_success")
+
+        # 整组提交两个原件：3 行 + 4 行
+        assert out["small_file_count"] == 2
+        assert out["source_rows"] == 7
+
+        # 换版前压实扫描只读到两个原件 7 行，不把 staged 产物算进来
+        assert out["pre_swap_scan_files"] == 2
+        assert out["pre_swap_scan_rows"] == 7
+        assert out["skipped_staged_count"] == 1
+        assert out["pre_swap_ticket_id"]
+
+        # 恢复先确认换版，旧工单交回重排且不申报处理行数
+        assert out["recovery_phase"] == "confirmed"
+        assert out["stale_ticket_disposition"] == "return_for_reschedule"
+        assert out["stale_ticket_processed_rows"] is None
+
+        # 压实只接收一份确认清单：产物 7 行，输出 1 个文件
+        assert out["rows_before_compact"] == 7
+        assert out["compact_output_rows"] == 7
+        assert out["files_after_compact"] == 1
+
+        # 扫描后追加 2 行新文件：当前分区合计 9 行
+        assert out["rebased_file_count"] == 1
+        assert out["rows_after_compact"] == 9
+        assert out["partition_file_count_after"] == 2
+
+        # 原快照按编号回溯仍读到两个原文件、7 行
+        assert out["baseline_snapshot_rows"] == 7
+        assert out["baseline_snapshot_files"] == 1
+        # 归并回执记录首次确认的替换结果（两个原件 → 一个 7 行产物）
+        assert out["merge_receipt"]["source_file_count"] == 2
+        assert out["merge_receipt"]["product_rows"] == 7
 
 
 class TestChainStatsColumnCompact:
